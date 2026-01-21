@@ -1,10 +1,11 @@
 """MCP server for Asset Administration Shell (AAS) BaSyx integration."""
 
-import logging
+import logging, argparse, os
 
 from fastmcp import FastMCP
 from shellsmith.clients import AsyncClient
 from shellsmith.config import config
+
 
 logger = logging.getLogger(__name__)
 
@@ -659,15 +660,32 @@ async def main() -> None:
     """Run the MCP server."""
     logging.basicConfig(level=logging.INFO)
     logger.info("Starting AAS MCP server")
-    await app.run()
+    host = os.getenv("MCP_HTTP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_HTTP_PORT", "8000"))
+    path = os.getenv("MCP_HTTP_PATH", "/mcp")
+
+    await app.run(
+        transport="streamable-http",
+        host=host,
+        port=port,
+        path=path,
+    )
 
 
 def cli_main() -> None:
-    """CLI entry point for the MCP server."""
     logging.basicConfig(level=logging.INFO)
     logger.info("Starting AAS MCP server")
-    app.run()
 
+    host = os.getenv("MCP_HTTP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_HTTP_PORT", "8000"))
+    path = os.getenv("MCP_HTTP_PATH", "/mcp")
+
+    app.run(
+        transport="streamable-http",
+        host=host,
+        port=port,
+        path=path,
+    )
 
 if __name__ == "__main__":
     cli_main()
