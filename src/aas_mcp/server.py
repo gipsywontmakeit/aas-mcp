@@ -3,13 +3,19 @@ MCP server for Asset Administration Shell (AAS) BaSyx integration.
 
 LLM-navigation upgrades (no hardcode for specific questions):
 - ALWAYS uses encode=True for any BaSyx call that takes AAS/Submodel IDs in the path
-- build_index() + search(): lightweight discovery (avoid full list scans)
+- build_index() + search(): lightweight discovery (avoid full list scans where possible)
 - resolve_identifier(): idShort/URL resolution with candidates
 - describe_shell(): compact “map” of shell + linked submodels
 - describe_submodel(): outline + validPaths (avoid guessing idShort paths)
 - get_submodel_element(): NotFound returns suggestions + hint (anti-loop UX)
 - TTL cache + in-flight dedupe (prevents repeated/loop calls hammering BaSyx)
 - TOOL_START / TOOL_END / TOOL_ERROR logging with dt_ms and result summaries
+
+IMPORTANT:
+FastMCP turns @app.tool functions into tool objects. Tools must NOT call other tools
+directly (it becomes 'FunctionTool' not callable). Therefore:
+- All shared logic lives in internal *_impl helpers
+- Tools are thin wrappers that call those helpers
 """
 
 import asyncio
@@ -20,8 +26,9 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Tuple, List, Dict
 
+import httpx
 from fastmcp import FastMCP
 from shellsmith.clients import AsyncClient
 from shellsmith.config import config
@@ -166,11 +173,16 @@ def _args_key(tool: str, kwargs: dict) -> str:
     return f"{tool}:{h}"
 
 
-async def _cached_call(*, key: str, ttl_s: float, fn) -> tuple[Any, bool]:
+async def _cached_call(*, key: str, ttl_s: float, fn: Callable[[], Any]) -> Tuple[Any, bool]:
     """
     Returns (value, cache_hit).
     - TTL cache for repeated calls
     - in-flight dedupe so identical concurrent calls only hit BaSyx once
+
+    IMPORTANT:
+    - Use this only for functions that RETURN normally.
+    - If you want to "handle errors and return a NotFound dict", do that inside fn()
+      so _cached_call never needs to set_exception on inflight futures.
     """
     async with _CACHE_LOCK:
         entry = _CACHE.get(key)
@@ -198,10 +210,12 @@ async def _cached_call(*, key: str, ttl_s: float, fn) -> tuple[Any, bool]:
             _INFLIGHT.pop(key, None)
         return val, False
     except Exception as e:
+        # Owner failed; ensure we don't leak inflight
         async with _CACHE_LOCK:
+            _INFLIGHT.pop(key, None)
+            # NOTE: we still set_exception so waiters fail consistently
             if not fut.done():
                 fut.set_exception(e)
-            _INFLIGHT.pop(key, None)
         raise
 
 
@@ -253,8 +267,8 @@ def _rank_match(text: str, q: str) -> int:
     return 99
 
 
-def _top_matches(items: list[dict], q: str, limit: int) -> list[dict]:
-    scored: list[tuple[int, dict]] = []
+def _top_matches(items: List[dict], q: str, limit: int) -> List[dict]:
+    scored: List[Tuple[int, dict]] = []
     for it in items:
         idshort = it.get("idShort") or ""
         sid = it.get("id") or ""
@@ -265,17 +279,30 @@ def _top_matches(items: list[dict], q: str, limit: int) -> list[dict]:
     return [it for _, it in scored[: max(1, limit)]]
 
 
-async def _build_index(host: str) -> dict:
+def _unwrap_shellsmith_list(obj: Any) -> Any:
+    """
+    Shellsmith/BaSyx responses vary: sometimes list, sometimes dict with 'result' or dict with 'data'.
+    We normalize lightly for indexing/search.
+    """
+    if isinstance(obj, dict):
+        if "result" in obj:
+            return obj.get("result")
+        if "data" in obj:
+            return obj.get("data")
+    return obj
+
+
+async def _build_index_impl(host: str) -> dict:
     # Use raw client calls (no tool recursion)
     async with AsyncClient(host=host) as client:
-        shells = await client.get_shells()
-        submodels = await client.get_submodels()
+        shells_raw = await client.get_shells()
+        submodels_raw = await client.get_submodels()
 
-    shells_items = shells.get("result", shells) if isinstance(shells, dict) else shells
-    subs_items = submodels.get("result", submodels) if isinstance(submodels, dict) else submodels
+    shells_items = _unwrap_shellsmith_list(shells_raw)
+    subs_items = _unwrap_shellsmith_list(submodels_raw)
 
-    shell_by_idshort: dict[str, str] = {}
-    shell_submodels: dict[str, list[str]] = {}
+    shell_by_idshort: Dict[str, str] = {}
+    shell_submodels: Dict[str, List[str]] = {}
 
     if isinstance(shells_items, list):
         for sh in shells_items:
@@ -286,7 +313,7 @@ async def _build_index(host: str) -> dict:
             if sid and idshort:
                 shell_by_idshort[idshort] = sid
 
-            sm_ids: list[str] = []
+            sm_ids: List[str] = []
             for smref in (sh.get("submodels") or []):
                 if not isinstance(smref, dict):
                     continue
@@ -297,7 +324,7 @@ async def _build_index(host: str) -> dict:
             if sid:
                 shell_submodels[sid] = sm_ids
 
-    submodels_by_idshort: dict[str, list[str]] = {}
+    submodels_by_idshort: Dict[str, List[str]] = {}
     if isinstance(subs_items, list):
         for sm in subs_items:
             if not isinstance(sm, dict):
@@ -321,9 +348,77 @@ async def _build_index(host: str) -> dict:
     }
 
 
-async def _ensure_index(host: str, max_age_s: float = 60.0) -> None:
+async def _ensure_index_impl(host: str, max_age_s: float = 60.0) -> None:
     if _INDEX.get("host") != host or (_now_s() - float(_INDEX.get("built_at", 0.0))) > max_age_s:
-        await _build_index(host)
+        await _build_index_impl(host)
+
+
+async def _search_impl(kind: str, query: str, host: str, limit: int = 10) -> dict:
+    query = _norm(query)
+    if not query:
+        return {"meta": {"note": "empty query"}, "data": []}
+
+    await _ensure_index_impl(host)
+
+    if kind == "shell":
+        items = [{"idShort": k, "id": v} for k, v in _INDEX["shell_by_idshort"].items()]
+        results = _top_matches(items, query, limit)
+        return {"meta": {"kind": kind, "query": query, "limit": limit}, "data": results}
+
+    if kind == "submodel":
+        items: List[dict] = []
+        for idshort, ids in _INDEX["submodels_by_idshort"].items():
+            for sid in ids:
+                items.append({"idShort": idshort, "id": sid})
+        results = _top_matches(items, query, limit)
+        return {"meta": {"kind": kind, "query": query, "limit": limit}, "data": results}
+
+    return {"error": "InvalidKind", "message": "kind must be 'shell' or 'submodel'"}
+
+
+async def _resolve_identifier_impl(value: str, host: str, kinds: List[str]) -> dict:
+    """
+    Internal resolver (no tool recursion).
+    """
+    value = _norm(value)
+    if not value:
+        return {"error": "EmptyValue"}
+
+    if _looks_like_url(value):
+        return {"input": value, "detected": "url", "resolved": {"id": value}, "candidates": []}
+
+    await _ensure_index_impl(host)
+
+    resolved = None
+    candidates: List[dict] = []
+
+    if "shell" in kinds:
+        sid = _INDEX["shell_by_idshort"].get(value)
+        if sid:
+            resolved = {"type": "shell", "idShort": value, "id": sid}
+
+    if resolved is None and "submodel" in kinds:
+        smids = _INDEX["submodels_by_idshort"].get(value) or []
+        if len(smids) == 1:
+            resolved = {"type": "submodel", "idShort": value, "id": smids[0]}
+        elif len(smids) > 1:
+            candidates = [{"type": "submodel", "idShort": value, "id": x} for x in smids]
+
+    if resolved is None:
+        for k in kinds:
+            hits = await _search_impl(k, value, host=host, limit=5)
+            for it in hits.get("data", []):
+                candidates.append({"type": k, "idShort": it.get("idShort"), "id": it.get("id")})
+
+        return {
+            "input": value,
+            "detected": "idShort",
+            "resolved": None,
+            "candidates": candidates,
+            "message": "Not found as exact idShort. See candidates.",
+        }
+
+    return {"input": value, "detected": "idShort", "resolved": resolved, "candidates": candidates}
 
 
 # -----------------------------
@@ -356,7 +451,7 @@ def _outline_element(elem: dict, depth: int, max_children: int) -> dict:
     return out
 
 
-def _collect_paths(elem: dict, base: str, depth: int, max_children: int, acc: list[str]) -> None:
+def _collect_paths(elem: dict, base: str, depth: int, max_children: int, acc: List[str]) -> None:
     if not isinstance(elem, dict):
         return
     idshort = elem.get("idShort")
@@ -372,9 +467,9 @@ def _collect_paths(elem: dict, base: str, depth: int, max_children: int, acc: li
             _collect_paths(c, path, depth - 1, max_children, acc)
 
 
-def _suggest_paths(paths: list[str], bad: str, limit: int = 10) -> list[str]:
+def _suggest_paths(paths: List[str], bad: str, limit: int = 10) -> List[str]:
     bad_l = (bad or "").lower()
-    scored: list[tuple[int, str]] = []
+    scored: List[Tuple[int, str]] = []
     for p in paths:
         pl = p.lower()
         score = 99
@@ -387,6 +482,26 @@ def _suggest_paths(paths: list[str], bad: str, limit: int = 10) -> list[str]:
         scored.append((score, p))
     scored.sort(key=lambda x: x[0])
     return [p for s, p in scored[:limit] if s < 99]
+
+
+# -----------------------------
+# HTTP error helpers
+# -----------------------------
+
+def _is_http_404(e: Exception) -> bool:
+    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+        return e.response.status_code == 404
+    return False
+
+
+def _http_err_details(e: Exception) -> dict:
+    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+        return {
+            "status_code": e.response.status_code,
+            "url": str(e.request.url) if e.request is not None else None,
+            "text": (e.response.text or "")[:400],
+        }
+    return {"error": repr(e)}
 
 
 # -----------------------------
@@ -422,7 +537,7 @@ async def build_index(host: str = config.host, refresh: bool = False) -> dict:
     key = _args_key("build_index", {"host": host})
 
     async def _do():
-        return await _build_index(host)
+        return await _build_index_impl(host)
 
     if refresh:
         res = await _do()
@@ -435,30 +550,8 @@ async def build_index(host: str = config.host, refresh: bool = False) -> dict:
 @app.tool()
 @log_tool
 async def search(kind: str, query: str, host: str = config.host, limit: int = 10) -> dict:
-    """
-    Lightweight search for shells/submodels by idShort or id (URL).
-    kind: "shell" | "submodel"
-    """
-    query = _norm(query)
-    if not query:
-        return {"meta": {"note": "empty query"}, "data": []}
-
-    await _ensure_index(host)
-
-    if kind == "shell":
-        items = [{"idShort": k, "id": v} for k, v in _INDEX["shell_by_idshort"].items()]
-        results = _top_matches(items, query, limit)
-        return {"meta": {"kind": kind, "query": query, "limit": limit}, "data": results}
-
-    if kind == "submodel":
-        items: list[dict] = []
-        for idshort, ids in _INDEX["submodels_by_idshort"].items():
-            for sid in ids:
-                items.append({"idShort": idshort, "id": sid})
-        results = _top_matches(items, query, limit)
-        return {"meta": {"kind": kind, "query": query, "limit": limit}, "data": results}
-
-    return {"error": "InvalidKind", "message": "kind must be 'shell' or 'submodel'"}
+    """Lightweight search for shells/submodels by idShort or id (URL). kind: 'shell' | 'submodel'."""
+    return await _search_impl(kind=kind, query=query, host=host, limit=limit)
 
 
 @app.tool()
@@ -470,45 +563,7 @@ async def resolve_identifier(value: str, host: str = config.host, kinds: list[st
     - idShort (uses index)
     If not found, returns candidates (via search).
     """
-    value = _norm(value)
-    if not value:
-        return {"error": "EmptyValue"}
-
-    if _looks_like_url(value):
-        return {"input": value, "detected": "url", "resolved": {"id": value}, "candidates": []}
-
-    await _ensure_index(host)
-
-    resolved = None
-    candidates: list[dict] = []
-
-    if "shell" in kinds:
-        sid = _INDEX["shell_by_idshort"].get(value)
-        if sid:
-            resolved = {"type": "shell", "idShort": value, "id": sid}
-
-    if resolved is None and "submodel" in kinds:
-        smids = _INDEX["submodels_by_idshort"].get(value) or []
-        if len(smids) == 1:
-            resolved = {"type": "submodel", "idShort": value, "id": smids[0]}
-        elif len(smids) > 1:
-            candidates = [{"type": "submodel", "idShort": value, "id": x} for x in smids]
-
-    if resolved is None:
-        for k in kinds:
-            hits = await search(k, value, host=host, limit=5)
-            for it in hits.get("data", []):
-                candidates.append({"type": k, "idShort": it.get("idShort"), "id": it.get("id")})
-
-        return {
-            "input": value,
-            "detected": "idShort",
-            "resolved": None,
-            "candidates": candidates,
-            "message": "Not found as exact idShort. See candidates.",
-        }
-
-    return {"input": value, "detected": "idShort", "resolved": resolved, "candidates": candidates}
+    return await _resolve_identifier_impl(value=value, host=host, kinds=list(kinds))
 
 
 @app.tool()
@@ -539,7 +594,6 @@ async def get_tool_guide(goal: str = "navigate_aas") -> dict:
 @app.tool()
 @log_tool
 async def get_shells(host: str = config.host) -> dict:
-    # No ID in path; encoding irrelevant
     key = _args_key("get_shells", {"host": host})
 
     async def _do():
@@ -555,7 +609,6 @@ async def get_shells(host: str = config.host) -> dict:
 @app.tool()
 @log_tool
 async def get_shell(shell_id: str, host: str = config.host) -> dict:
-    # ALWAYS encode=True for ID-based endpoints
     key = _args_key("get_shell", {"shell_id": shell_id, "host": host})
 
     async def _do():
@@ -629,7 +682,6 @@ async def delete_submodel_ref(shell_id: str, submodel_id: str, host: str = confi
 @app.tool()
 @log_tool
 async def get_submodels(host: str = config.host) -> dict:
-    # No ID in path; encoding irrelevant
     key = _args_key("get_submodels", {"host": host})
 
     async def _do():
@@ -725,13 +777,12 @@ async def describe_shell(shell: str, host: str = config.host) -> dict:
     """
     t0 = time.perf_counter()
 
-    rid = await resolve_identifier(shell, host=host, kinds=["shell"])
+    rid = await _resolve_identifier_impl(shell, host=host, kinds=["shell"])
     if rid.get("resolved") is None:
         return {"error": "ShellNotResolved", "details": rid}
 
     shell_id = rid["resolved"]["id"]
 
-    # Use raw client calls (avoid nesting meta wrappers)
     key_shell = _args_key("client.get_shell", {"shell_id": shell_id, "host": host})
     async def _do_shell():
         async with AsyncClient(host=host) as client:
@@ -746,8 +797,8 @@ async def describe_shell(shell: str, host: str = config.host) -> dict:
 
     refs_obj, hit_refs = await _cached_call(key=key_refs, ttl_s=30.0, fn=_do_refs)
 
-    refs_items = refs_obj.get("result", refs_obj) if isinstance(refs_obj, dict) else refs_obj
-    submodel_ids: list[str] = []
+    refs_items = _unwrap_shellsmith_list(refs_obj)
+    submodel_ids: List[str] = []
     if isinstance(refs_items, list):
         for r in refs_items:
             if not isinstance(r, dict):
@@ -756,8 +807,8 @@ async def describe_shell(shell: str, host: str = config.host) -> dict:
                 if isinstance(k, dict) and k.get("type") == "Submodel" and k.get("value"):
                     submodel_ids.append(k["value"])
 
-    # Attach submodel metadata (idShort) with cache; do not fail the whole call if some fail
-    submodels: list[dict] = []
+    # Attach submodel metadata (idShort) with cache; tolerate failures
+    submodels: List[dict] = []
     for smid in submodel_ids[:200]:
         key_smmeta = _args_key("client.get_submodel_metadata", {"submodel_id": smid, "host": host})
         async def _do_smmeta(smid=smid):
@@ -765,11 +816,14 @@ async def describe_shell(shell: str, host: str = config.host) -> dict:
                 return await client.get_submodel_metadata(smid, encode=True)
         try:
             smmeta, _ = await _cached_call(key=key_smmeta, ttl_s=120.0, fn=_do_smmeta)
-            submodels.append({
-                "id": smid,
-                "idShort": smmeta.get("idShort") if isinstance(smmeta, dict) else None,
-                "semanticId": smmeta.get("semanticId") if isinstance(smmeta, dict) else None,
-            })
+            if isinstance(smmeta, dict):
+                submodels.append({
+                    "id": smid,
+                    "idShort": smmeta.get("idShort"),
+                    "semanticId": smmeta.get("semanticId"),
+                })
+            else:
+                submodels.append({"id": smid, "idShort": None, "semanticId": None})
         except Exception:
             submodels.append({"id": smid, "idShort": None, "semanticId": None})
 
@@ -808,7 +862,7 @@ async def describe_submodel(
     """
     t0 = time.perf_counter()
 
-    rid = await resolve_identifier(submodel, host=host, kinds=["submodel"])
+    rid = await _resolve_identifier_impl(submodel, host=host, kinds=["submodel"])
     if rid.get("resolved") is None:
         return {"error": "SubmodelNotResolved", "details": rid}
 
@@ -835,7 +889,7 @@ async def describe_submodel(
         "elements_total": len(elements) if isinstance(elements, list) else None,
     }
 
-    paths: list[str] = []
+    paths: List[str] = []
     if isinstance(elements, list):
         for e in elements[:max_children]:
             _collect_paths(e, base="", depth=depth, max_children=max_children, acc=paths)
@@ -885,6 +939,10 @@ async def get_submodel_element(
     Gets a submodel element by path.
     On NotFound, returns suggestions + hint (prevents LLM loops).
     ALWAYS uses encode=True internally.
+
+    IMPORTANT:
+    - We treat 404 inside _do() and return a normal dict (no exception),
+      so _cached_call will never set_exception on inflight futures for NotFound.
     """
     id_short_path = _norm(id_short_path)
     key = _args_key(
@@ -894,15 +952,26 @@ async def get_submodel_element(
 
     async def _do():
         async with AsyncClient(host=host) as client:
-            return await client.get_submodel_element(submodel_id, id_short_path, encode=True)
+            try:
+                return await client.get_submodel_element(submodel_id, id_short_path, encode=True)
+            except Exception as e:
+                if _is_http_404(e):
+                    return {
+                        "__not_found__": True,
+                        "error": "NotFound",
+                        "message": "Element path not found",
+                        "path": id_short_path,
+                        "details": _http_err_details(e),
+                    }
+                raise
 
     t0 = time.perf_counter()
-    try:
-        res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        return _with_meta(tool="get_submodel_element", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=res)
-    except Exception as e:
-        suggestions: list[str] = []
+    res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+
+    # If it was NotFound, add suggestions (best-effort) and return as "data"
+    if isinstance(res, dict) and res.get("__not_found__"):
+        suggestions: List[str] = []
         try:
             desc = await describe_submodel(submodel_id, host=host, depth=2, max_children=80)
             paths = (desc.get("data") or {}).get("validPaths") or []
@@ -910,14 +979,13 @@ async def get_submodel_element(
         except Exception:
             suggestions = []
 
-        return {
-            "error": "NotFound",
-            "message": "Element path not found",
-            "path": id_short_path,
-            "suggestions": suggestions,
-            "hint": "Call describe_submodel() and use validPaths before guessing paths.",
-            "details": repr(e),
-        }
+        payload = dict(res)
+        payload.pop("__not_found__", None)
+        payload["suggestions"] = suggestions
+        payload["hint"] = "Call describe_submodel() and use validPaths before guessing paths."
+        return _with_meta(tool="get_submodel_element", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=payload)
+
+    return _with_meta(tool="get_submodel_element", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=res)
 
 
 @app.tool()
@@ -983,6 +1051,11 @@ async def is_healthy(host: str = config.host, timeout: float = config.timeout) -
     async with AsyncClient(host=host, timeout=timeout) as client:
         return await client.is_healthy()
 
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+
 def cli_main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -999,7 +1072,5 @@ def cli_main() -> None:
         transport="streamable-http",
         host=host,
         port=port,
-       	path=path,
+        path=path,
     )
-
-
