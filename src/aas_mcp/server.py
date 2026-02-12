@@ -503,6 +503,59 @@ def _http_err_details(e: Exception) -> dict:
         }
     return {"error": repr(e)}
 
+async def _describe_submodel_impl(
+    submodel: str,
+    host: str,
+    depth: int = 2,
+    max_children: int = 50,
+) -> dict:
+    t0 = time.perf_counter()
+
+    rid = await _resolve_identifier_impl(submodel, host=host, kinds=["submodel"])
+    if rid.get("resolved") is None:
+        return {"error": "SubmodelNotResolved", "details": rid}
+
+    submodel_id = rid["resolved"]["id"]
+
+    key_sm = _args_key("client.get_submodel", {"submodel_id": submodel_id, "host": host})
+
+    async def _do_sm():
+        async with AsyncClient(host=host) as client:
+            return await client.get_submodel(submodel_id, encode=True)
+
+    sm_obj, hit = await _cached_call(key=key_sm, ttl_s=60.0, fn=_do_sm)
+
+    elements = (sm_obj.get("submodelElements") or []) if isinstance(sm_obj, dict) else []
+
+    outline = {
+        "id": sm_obj.get("id") if isinstance(sm_obj, dict) else submodel_id,
+        "idShort": sm_obj.get("idShort") if isinstance(sm_obj, dict) else rid["resolved"].get("idShort"),
+        "modelType": sm_obj.get("modelType") if isinstance(sm_obj, dict) else "Submodel",
+        "elements": [
+            _outline_element(e, depth=depth, max_children=max_children)
+            for e in (elements[:max_children] if isinstance(elements, list) else [])
+            if isinstance(e, dict)
+        ],
+        "elements_truncated": isinstance(elements, list) and len(elements) > max_children,
+        "elements_total": len(elements) if isinstance(elements, list) else None,
+    }
+
+    paths: List[str] = []
+    if isinstance(elements, list):
+        for e in elements[:max_children]:
+            _collect_paths(e, base="", depth=depth, max_children=max_children, acc=paths)
+
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    return _with_meta(
+        tool="describe_submodel",
+        host=host,
+        encode=True,
+        dt_ms=dt_ms,
+        cache_hit=hit,
+        data={"outline": outline, "validPaths": paths},
+    )
+
+
 
 # -----------------------------
 # MCP App
@@ -855,55 +908,12 @@ async def describe_submodel(
     depth: int = 2,
     max_children: int = 50,
 ) -> dict:
-    """
-    Outline of a submodel + validPaths to prevent guessing idShort paths.
-    Input can be idShort or URL (submodel id).
-    ALWAYS uses encode=True internally.
-    """
-    t0 = time.perf_counter()
-
-    rid = await _resolve_identifier_impl(submodel, host=host, kinds=["submodel"])
-    if rid.get("resolved") is None:
-        return {"error": "SubmodelNotResolved", "details": rid}
-
-    submodel_id = rid["resolved"]["id"]
-
-    key_sm = _args_key("client.get_submodel", {"submodel_id": submodel_id, "host": host})
-    async def _do_sm():
-        async with AsyncClient(host=host) as client:
-            return await client.get_submodel(submodel_id, encode=True)
-
-    sm_obj, hit = await _cached_call(key=key_sm, ttl_s=60.0, fn=_do_sm)
-
-    elements = (sm_obj.get("submodelElements") or []) if isinstance(sm_obj, dict) else []
-    outline = {
-        "id": sm_obj.get("id") if isinstance(sm_obj, dict) else submodel_id,
-        "idShort": sm_obj.get("idShort") if isinstance(sm_obj, dict) else rid["resolved"].get("idShort"),
-        "modelType": sm_obj.get("modelType") if isinstance(sm_obj, dict) else "Submodel",
-        "elements": [
-            _outline_element(e, depth=depth, max_children=max_children)
-            for e in (elements[:max_children] if isinstance(elements, list) else [])
-            if isinstance(e, dict)
-        ],
-        "elements_truncated": isinstance(elements, list) and len(elements) > max_children,
-        "elements_total": len(elements) if isinstance(elements, list) else None,
-    }
-
-    paths: List[str] = []
-    if isinstance(elements, list):
-        for e in elements[:max_children]:
-            _collect_paths(e, base="", depth=depth, max_children=max_children, acc=paths)
-
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    return _with_meta(
-        tool="describe_submodel",
+    return await _describe_submodel_impl(
+        submodel=submodel,
         host=host,
-        encode=True,
-        dt_ms=dt_ms,
-        cache_hit=hit,
-        data={"outline": outline, "validPaths": paths},
+        depth=depth,
+        max_children=max_children,
     )
-
 
 # -----------------------------
 # Tools: Submodel element operations
@@ -973,7 +983,7 @@ async def get_submodel_element(
     if isinstance(res, dict) and res.get("__not_found__"):
         suggestions: List[str] = []
         try:
-            desc = await describe_submodel(submodel_id, host=host, depth=2, max_children=80)
+            desc = await _describe_submodel_impl(submodel=submodel_id, host=host, depth=2, max_children=80)
             paths = (desc.get("data") or {}).get("validPaths") or []
             suggestions = _suggest_paths(paths, id_short_path, limit=10)
         except Exception:
