@@ -416,7 +416,7 @@ def _collect_paths(elem: dict, base: str, depth: int, max_children: int, acc: Li
     idshort = elem.get("idShort")
     if not idshort:
         return
-    path = f"{base}/{idshort}" if base else idshort
+    path = f"{base}.{idshort}" if base else idshort
     acc.append(path)
     if depth <= 0:
         return
@@ -843,6 +843,7 @@ async def get_submodel_element(
     ALWAYS uses encode=True internally.
     """
     id_short_path = _norm(id_short_path)
+    id_short_path = id_short_path.replace("/", ".")
     key = _args_key(
         "client.get_submodel_element",
         {"submodel_id": submodel_id, "id_short_path": id_short_path, "host": host},
@@ -893,6 +894,7 @@ async def get_submodel_element_value(
     host: str = config.host,
 ) -> dict | list | str | int | float | bool | None:
     """Get the raw value of a submodel element."""
+    id_short_path = id_short_path.replace("/", ".")
     async with AsyncClient(host=host) as client:
         return await client.get_submodel_element_value(submodel_id, id_short_path, encode=True)
 
