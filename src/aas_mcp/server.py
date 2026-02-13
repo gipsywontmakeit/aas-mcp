@@ -1,11 +1,11 @@
 """
-MCP server for Asset Administration Shell (AAS) BaSyx integration.
+MCP server for Asset Administration Shell (AAS) BaSyx integration (READ-ONLY).
 
 LLM-navigation upgrades (no hardcode for specific questions):
 - ALWAYS uses encode=True for any BaSyx call that takes AAS/Submodel IDs in the path
 - build_index() + search(): lightweight discovery (avoid full list scans where possible)
 - resolve_identifier(): idShort/URL resolution with candidates
-- describe_shell(): compact “map” of shell + linked submodels
+- describe_shell(): compact "map" of shell + linked submodels
 - describe_submodel(): outline + validPaths (avoid guessing idShort paths)
 - get_submodel_element(): NotFound returns suggestions + hint (anti-loop UX)
 - TTL cache + in-flight dedupe (prevents repeated/loop calls hammering BaSyx)
@@ -68,9 +68,6 @@ def _summarize_result(res: Any) -> str:
 
 
 def _pick_kwargs(kwargs: dict) -> str:
-    """
-    Log only the most useful parameters (and avoid dumping full payloads like 'shell' or 'submodel').
-    """
     interesting = [
         "shell_id",
         "submodel_id",
@@ -83,29 +80,11 @@ def _pick_kwargs(kwargs: dict) -> str:
         "value",
     ]
     picked = {k: kwargs.get(k) for k in interesting if k in kwargs}
-
-    # Avoid huge payloads
-    if "shell" in kwargs:
-        picked["shell"] = "<dict>"
-    if "submodel" in kwargs:
-        picked["submodel"] = "<dict>"
-    if "element" in kwargs:
-        picked["element"] = "<dict>"
-    if "value" in kwargs:
-        v = kwargs["value"]
-        picked["value"] = f"<{type(v).__name__}>"
-
     return ", ".join(f"{k}={picked[k]!r}" for k in picked.keys()) or "(no-key-args)"
 
 
 def log_tool(fn):
-    """
-    Decorator for MCP tools that logs:
-    - start/end/error
-    - elapsed time
-    - key args
-    - result summary
-    """
+    """Decorator for MCP tools that logs start/end/error with timing."""
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
         call_id = _next_call_id()
@@ -174,16 +153,6 @@ def _args_key(tool: str, kwargs: dict) -> str:
 
 
 async def _cached_call(*, key: str, ttl_s: float, fn: Callable[[], Any]) -> Tuple[Any, bool]:
-    """
-    Returns (value, cache_hit).
-    - TTL cache for repeated calls
-    - in-flight dedupe so identical concurrent calls only hit BaSyx once
-
-    IMPORTANT:
-    - Use this only for functions that RETURN normally.
-    - If you want to "handle errors and return a NotFound dict", do that inside fn()
-      so _cached_call never needs to set_exception on inflight futures.
-    """
     async with _CACHE_LOCK:
         entry = _CACHE.get(key)
         if entry and entry.expires_at > _now_s():
@@ -210,10 +179,8 @@ async def _cached_call(*, key: str, ttl_s: float, fn: Callable[[], Any]) -> Tupl
             _INFLIGHT.pop(key, None)
         return val, False
     except Exception as e:
-        # Owner failed; ensure we don't leak inflight
         async with _CACHE_LOCK:
             _INFLIGHT.pop(key, None)
-            # NOTE: we still set_exception so waiters fail consistently
             if not fut.done():
                 fut.set_exception(e)
         raise
@@ -239,9 +206,9 @@ def _with_meta(*, tool: str, host: str, encode: Optional[bool], dt_ms: float, ca
 _INDEX: dict[str, Any] = {
     "built_at": 0.0,
     "host": None,
-    "shell_by_idshort": {},       # idShort -> shellId(URL)
-    "submodels_by_idshort": {},   # idShort -> [submodelId(URL)]
-    "shell_submodels": {},        # shellId -> [submodelId]
+    "shell_by_idshort": {},
+    "submodels_by_idshort": {},
+    "shell_submodels": {},
 }
 
 
@@ -280,10 +247,6 @@ def _top_matches(items: List[dict], q: str, limit: int) -> List[dict]:
 
 
 def _unwrap_shellsmith_list(obj: Any) -> Any:
-    """
-    Shellsmith/BaSyx responses vary: sometimes list, sometimes dict with 'result' or dict with 'data'.
-    We normalize lightly for indexing/search.
-    """
     if isinstance(obj, dict):
         if "result" in obj:
             return obj.get("result")
@@ -293,7 +256,6 @@ def _unwrap_shellsmith_list(obj: Any) -> Any:
 
 
 async def _build_index_impl(host: str) -> dict:
-    # Use raw client calls (no tool recursion)
     async with AsyncClient(host=host) as client:
         shells_raw = await client.get_shells()
         submodels_raw = await client.get_submodels()
@@ -377,9 +339,6 @@ async def _search_impl(kind: str, query: str, host: str, limit: int = 10) -> dic
 
 
 async def _resolve_identifier_impl(value: str, host: str, kinds: List[str]) -> dict:
-    """
-    Internal resolver (no tool recursion).
-    """
     value = _norm(value)
     if not value:
         return {"error": "EmptyValue"}
@@ -503,6 +462,7 @@ def _http_err_details(e: Exception) -> dict:
         }
     return {"error": repr(e)}
 
+
 async def _describe_submodel_impl(
     submodel: str,
     host: str,
@@ -556,7 +516,6 @@ async def _describe_submodel_impl(
     )
 
 
-
 # -----------------------------
 # MCP App
 # -----------------------------
@@ -564,7 +523,7 @@ async def _describe_submodel_impl(
 app = FastMCP(
     name="aas-mcp",
     instructions="""
-This server provides tools for managing Asset Administration Shells (AAS)
+This server provides READ-ONLY tools for navigating Asset Administration Shells (AAS)
 using the Shellsmith Python SDK to interact with Eclipse BaSyx environments.
 
 IMPORTANT (BaSyx encoding):
@@ -641,12 +600,13 @@ async def get_tool_guide(goal: str = "navigate_aas") -> dict:
 
 
 # -----------------------------
-# Tools: Shell management
+# Tools: Shell read operations
 # -----------------------------
 
 @app.tool()
 @log_tool
 async def get_shells(host: str = config.host) -> dict:
+    """Get all shells from the BaSyx environment."""
     key = _args_key("get_shells", {"host": host})
 
     async def _do():
@@ -662,6 +622,7 @@ async def get_shells(host: str = config.host) -> dict:
 @app.tool()
 @log_tool
 async def get_shell(shell_id: str, host: str = config.host) -> dict:
+    """Get a specific shell by its full ID (URL)."""
     key = _args_key("get_shell", {"shell_id": shell_id, "host": host})
 
     async def _do():
@@ -674,34 +635,14 @@ async def get_shell(shell_id: str, host: str = config.host) -> dict:
     return _with_meta(tool="get_shell", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=res)
 
 
-@app.tool()
-@log_tool
-async def create_shell(shell: dict, host: str = config.host) -> dict:
-    async with AsyncClient(host=host) as client:
-        return await client.create_shell(shell)
-
-
-@app.tool()
-@log_tool
-async def update_shell(shell_id: str, shell: dict, host: str = config.host) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.update_shell(shell_id, shell, encode=True)
-
-
-@app.tool()
-@log_tool
-async def delete_shell(shell_id: str, host: str = config.host) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.delete_shell(shell_id, encode=True)
-
-
 # -----------------------------
-# Tools: Submodel references
+# Tools: Submodel references (read-only)
 # -----------------------------
 
 @app.tool()
 @log_tool
 async def get_submodel_refs(shell_id: str, host: str = config.host) -> dict:
+    """Get submodel references for a shell."""
     key = _args_key("get_submodel_refs", {"shell_id": shell_id, "host": host})
 
     async def _do():
@@ -714,27 +655,14 @@ async def get_submodel_refs(shell_id: str, host: str = config.host) -> dict:
     return _with_meta(tool="get_submodel_refs", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=res)
 
 
-@app.tool()
-@log_tool
-async def create_submodel_ref(shell_id: str, submodel_ref: dict, host: str = config.host) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.create_submodel_ref(shell_id, submodel_ref, encode=True)
-
-
-@app.tool()
-@log_tool
-async def delete_submodel_ref(shell_id: str, submodel_id: str, host: str = config.host) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.delete_submodel_ref(shell_id, submodel_id, encode=True)
-
-
 # -----------------------------
-# Tools: Submodel management
+# Tools: Submodel read operations
 # -----------------------------
 
 @app.tool()
 @log_tool
 async def get_submodels(host: str = config.host) -> dict:
+    """Get all submodels from the BaSyx environment."""
     key = _args_key("get_submodels", {"host": host})
 
     async def _do():
@@ -750,6 +678,7 @@ async def get_submodels(host: str = config.host) -> dict:
 @app.tool()
 @log_tool
 async def get_submodel(submodel_id: str, host: str = config.host) -> dict:
+    """Get a specific submodel by its full ID (URL)."""
     key = _args_key("get_submodel", {"submodel_id": submodel_id, "host": host})
 
     async def _do():
@@ -764,46 +693,16 @@ async def get_submodel(submodel_id: str, host: str = config.host) -> dict:
 
 @app.tool()
 @log_tool
-async def create_submodel(submodel: dict, host: str = config.host) -> dict:
-    async with AsyncClient(host=host) as client:
-        return await client.create_submodel(submodel)
-
-
-@app.tool()
-@log_tool
-async def update_submodel(submodel_id: str, submodel: dict, host: str = config.host) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.update_submodel(submodel_id, submodel, encode=True)
-
-
-@app.tool()
-@log_tool
-async def delete_submodel(submodel_id: str, host: str = config.host) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.delete_submodel(submodel_id, encode=True)
-
-
-# -----------------------------
-# Tools: Value operations
-# -----------------------------
-
-@app.tool()
-@log_tool
 async def get_submodel_value(submodel_id: str, host: str = config.host) -> dict:
+    """Get the value of a submodel."""
     async with AsyncClient(host=host) as client:
         return await client.get_submodel_value(submodel_id, encode=True)
 
 
 @app.tool()
 @log_tool
-async def update_submodel_value(submodel_id: str, value: list[dict], host: str = config.host) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.update_submodel_value(submodel_id, value, encode=True)
-
-
-@app.tool()
-@log_tool
 async def get_submodel_metadata(submodel_id: str, host: str = config.host) -> dict:
+    """Get metadata for a submodel."""
     key = _args_key("get_submodel_metadata", {"submodel_id": submodel_id, "host": host})
 
     async def _do():
@@ -860,7 +759,6 @@ async def describe_shell(shell: str, host: str = config.host) -> dict:
                 if isinstance(k, dict) and k.get("type") == "Submodel" and k.get("value"):
                     submodel_ids.append(k["value"])
 
-    # Attach submodel metadata (idShort) with cache; tolerate failures
     submodels: List[dict] = []
     for smid in submodel_ids[:200]:
         key_smmeta = _args_key("client.get_submodel_metadata", {"submodel_id": smid, "host": host})
@@ -908,6 +806,10 @@ async def describe_submodel(
     depth: int = 2,
     max_children: int = 50,
 ) -> dict:
+    """
+    Submodel outline + validPaths for element navigation.
+    Input can be idShort or URL (submodel id).
+    """
     return await _describe_submodel_impl(
         submodel=submodel,
         host=host,
@@ -915,27 +817,17 @@ async def describe_submodel(
         max_children=max_children,
     )
 
+
 # -----------------------------
-# Tools: Submodel element operations
+# Tools: Submodel element read operations
 # -----------------------------
 
 @app.tool()
 @log_tool
 async def get_submodel_elements(submodel_id: str, host: str = config.host) -> dict:
+    """Get all elements of a submodel."""
     async with AsyncClient(host=host) as client:
         return await client.get_submodel_elements(submodel_id, encode=True)
-
-
-@app.tool()
-@log_tool
-async def create_submodel_element(
-    submodel_id: str,
-    element: dict,
-    id_short_path: Optional[str] = None,
-    host: str = config.host,
-) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.create_submodel_element(submodel_id, element, id_short_path, encode=True)
 
 
 @app.tool()
@@ -949,10 +841,6 @@ async def get_submodel_element(
     Gets a submodel element by path.
     On NotFound, returns suggestions + hint (prevents LLM loops).
     ALWAYS uses encode=True internally.
-
-    IMPORTANT:
-    - We treat 404 inside _do() and return a normal dict (no exception),
-      so _cached_call will never set_exception on inflight futures for NotFound.
     """
     id_short_path = _norm(id_short_path)
     key = _args_key(
@@ -979,7 +867,6 @@ async def get_submodel_element(
     res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
     dt_ms = (time.perf_counter() - t0) * 1000.0
 
-    # If it was NotFound, add suggestions (best-effort) and return as "data"
     if isinstance(res, dict) and res.get("__not_found__"):
         suggestions: List[str] = []
         try:
@@ -1000,48 +887,14 @@ async def get_submodel_element(
 
 @app.tool()
 @log_tool
-async def update_submodel_element(
-    submodel_id: str,
-    id_short_path: str,
-    element: dict,
-    host: str = config.host,
-) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.update_submodel_element(submodel_id, id_short_path, element, encode=True)
-
-
-@app.tool()
-@log_tool
-async def delete_submodel_element(
-    submodel_id: str,
-    id_short_path: str,
-    host: str = config.host,
-) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.delete_submodel_element(submodel_id, id_short_path, encode=True)
-
-
-@app.tool()
-@log_tool
 async def get_submodel_element_value(
     submodel_id: str,
     id_short_path: str,
     host: str = config.host,
 ) -> dict | list | str | int | float | bool | None:
+    """Get the raw value of a submodel element."""
     async with AsyncClient(host=host) as client:
         return await client.get_submodel_element_value(submodel_id, id_short_path, encode=True)
-
-
-@app.tool()
-@log_tool
-async def update_submodel_element_value(
-    submodel_id: str,
-    id_short_path: str,
-    value: str,
-    host: str = config.host,
-) -> None:
-    async with AsyncClient(host=host) as client:
-        await client.update_submodel_element_value(submodel_id, id_short_path, value, encode=True)
 
 
 # -----------------------------
@@ -1051,6 +904,7 @@ async def update_submodel_element_value(
 @app.tool()
 @log_tool
 async def get_health_status(host: str = config.host, timeout: float = config.timeout) -> str:
+    """Get the health status of the BaSyx environment."""
     async with AsyncClient(host=host, timeout=timeout) as client:
         return await client.get_health_status()
 
@@ -1058,6 +912,7 @@ async def get_health_status(host: str = config.host, timeout: float = config.tim
 @app.tool()
 @log_tool
 async def is_healthy(host: str = config.host, timeout: float = config.timeout) -> bool:
+    """Check if the BaSyx environment is healthy."""
     async with AsyncClient(host=host, timeout=timeout) as client:
         return await client.is_healthy()
 
