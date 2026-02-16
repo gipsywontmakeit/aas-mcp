@@ -630,7 +630,27 @@ async def get_shell(shell_id: str, host: str = config.host) -> dict:
             return await client.get_shell(shell_id, encode=True)
 
     t0 = time.perf_counter()
-    res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
+    try:
+        res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
+    except Exception as exc:
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 404:
+            return _with_meta(
+                tool="get_shell", host=host, encode=True,
+                dt_ms=dt_ms, cache_hit=False,
+                data={
+                    "error": "ShellNotFound",
+                    "message": (
+                        f"Shell '{shell_id}' does not exist in BaSyx. "
+                        f"You probably used the idShort instead of the id. "
+                        f"These can differ (e.g. idShort='TK-RECT-A' but id ends with 'TK-RECT-01'). "
+                        f"Go back to your get_shells result and use the exact 'id' field."
+                    ),
+                    "shell_id_used": shell_id,
+                },
+            )
+        raise
     dt_ms = (time.perf_counter() - t0) * 1000.0
     return _with_meta(tool="get_shell", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=res)
 
@@ -650,7 +670,27 @@ async def get_submodel_refs(shell_id: str, host: str = config.host) -> dict:
             return await client.get_submodel_refs(shell_id, encode=True)
 
     t0 = time.perf_counter()
-    res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
+    try:
+        res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
+    except Exception as exc:
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 404:
+            return _with_meta(
+                tool="get_submodel_refs", host=host, encode=True,
+                dt_ms=dt_ms, cache_hit=False,
+                data={
+                    "error": "ShellNotFound",
+                    "message": (
+                        f"Shell '{shell_id}' does not exist in BaSyx. "
+                        f"You probably used the idShort instead of the id. "
+                        f"These can differ (e.g. idShort='TK-RECT-A' but id ends with 'TK-RECT-01'). "
+                        f"Go back to your get_shells result and use the exact 'id' field."
+                    ),
+                    "shell_id_used": shell_id,
+                },
+            )
+        raise
     dt_ms = (time.perf_counter() - t0) * 1000.0
     return _with_meta(tool="get_submodel_refs", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=res)
 
