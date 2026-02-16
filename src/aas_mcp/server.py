@@ -136,7 +136,7 @@ class _CacheEntry:
 _CACHE: dict[str, _CacheEntry] = {}
 _INFLIGHT: dict[str, asyncio.Future] = {}
 _CACHE_LOCK = asyncio.Lock()
-
+_NOTFOUND_COUNTER: dict[str,int] = {}
 
 def _now_s() -> float:
     return time.time()
@@ -869,6 +869,22 @@ async def get_submodel_element(
     dt_ms = (time.perf_counter() - t0) * 1000.0
 
     if isinstance(res, dict) and res.get("__not_found__"):
+        counter_key = f"{submodel_id}::{id_short_path}"
+        _NOTFOUND_COUNTER[counter_key] = _NOTFOUND_COUNTER.get(counter_key, 0) + 1
+
+        if _NOTFOUND_COUNTER[counter_key] >= 3:
+            payload = {
+                "error": "RepeatedNotFound",
+                "message": (
+                    f"STOP: Path '{id_short_path}' has been tried {_NOTFOUND_COUNTER[counter_key]} times and does not exist. "
+                    f"You MUST call describe_submodel('{submodel_id}') to discover valid paths. "
+                    f"Do NOT retry this path."
+                ),
+                "path": id_short_path,
+            }
+            return _with_meta(tool="get_submodel_element", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=payload)
+
+
         suggestions: List[str] = []
         try:
             desc = await _describe_submodel_impl(submodel=submodel_id, host=host, depth=2, max_children=80)
