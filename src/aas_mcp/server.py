@@ -666,20 +666,14 @@ async def get_submodel_refs(shell_id: str, host: str = config.host) -> dict:
     key = _args_key("get_submodel_refs", {"shell_id": shell_id, "host": host})
 
     async def _do():
-        async with AsyncClient(host=host) as client:
-            return await client.get_submodel_refs(shell_id, encode=True)
-
-    t0 = time.perf_counter()
-    try:
-        res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
-    except Exception as exc:
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        if status == 404:
-            return _with_meta(
-                tool="get_submodel_refs", host=host, encode=True,
-                dt_ms=dt_ms, cache_hit=False,
-                data={
+        try:
+            async with AsyncClient(host=host) as client:
+                return await client.get_submodel_refs(shell_id, encode=True)
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 404:
+                return {
+                    "__shell_not_found__": True,
                     "error": "ShellNotFound",
                     "message": (
                         f"Shell '{shell_id}' does not exist in BaSyx. "
@@ -688,9 +682,11 @@ async def get_submodel_refs(shell_id: str, host: str = config.host) -> dict:
                         f"Go back to your get_shells result and use the exact 'id' field."
                     ),
                     "shell_id_used": shell_id,
-                },
-            )
-        raise
+                }
+            raise
+
+    t0 = time.perf_counter()
+    res, hit = await _cached_call(key=key, ttl_s=30.0, fn=_do)
     dt_ms = (time.perf_counter() - t0) * 1000.0
     return _with_meta(tool="get_submodel_refs", host=host, encode=True, dt_ms=dt_ms, cache_hit=hit, data=res)
 
